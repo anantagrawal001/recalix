@@ -1,0 +1,7 @@
+# RECALIX V9 — Training Dependencies
+# These are a subset of backend/requirements.txt
+# If you already installed backend deps, nothing extra needed.
+
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0

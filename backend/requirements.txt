@@ -1,0 +1,35 @@
+# RECALIX V9 — Python Dependencies
+# Install: pip install -r requirements.txt
+#
+# GPU (CUDA): pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CPU only:   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Apple MPS:  pip install torch torchvision  (standard PyTorch — MPS auto-detected)
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0.0
+
+# ── AI / Embeddings ───────────────────────────────────────────────────────────
+open-clip-torch>=2.24.0
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+
+# ── Image processing ──────────────────────────────────────────────────────────
+Pillow>=10.0.0
+
+# ── OCR ───────────────────────────────────────────────────────────────────────
+easyocr>=1.7.0
+
+# ── FAISS (optional but strongly recommended) ─────────────────────────────────
+# CPU:  pip install faiss-cpu
+# GPU:  pip install faiss-gpu
+faiss-cpu>=1.8.0
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+# SQLite is built into Python — no install needed
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-multipart>=0.0.9
+aiofiles>=23.0.0

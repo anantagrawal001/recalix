@@ -1,0 +1,8 @@
+{
+  "run_id": "20260405_174341",
+  "mode": "baseline",
+  "epochs": 1,
+  "lr": 0.001,
+  "batch_size": 64,
+  "time_seconds": 2461.4860701560974
+}

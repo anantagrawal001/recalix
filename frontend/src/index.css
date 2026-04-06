@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Google Fonts already loaded via index.html ──────────────────────────── */
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html {
+    font-family: 'DM Sans', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    background: #050508;
+    color: #c8c8dc;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar       { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #0a0a12; }
+  ::-webkit-scrollbar-thumb { background: #2a2a3d; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3d3d55; }
+
+  ::selection { background: rgba(108,99,255,0.35); color: #f0f0f8; }
+}
+
+@layer components {
+  /* Glass card */
+  .glass {
+    background: linear-gradient(135deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .glass-heavy {
+    background: linear-gradient(135deg, rgba(255,255,255,0.07) 0%, rgba(255,255,255,0.02) 100%);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  /* Shimmer skeleton */
+  .shimmer {
+    background: linear-gradient(90deg,
+      rgba(255,255,255,0.03) 0%,
+      rgba(255,255,255,0.08) 50%,
+      rgba(255,255,255,0.03) 100%);
+    background-size: 200% 100%;
+    animation: shimmer 1.8s infinite linear;
+  }
+
+  /* Accent gradient text */
+  .text-gradient {
+    background: linear-gradient(135deg, #6c63ff 0%, #a855f7 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Log line animation */
+  .log-line { animation: logIn 0.15s ease-out both; }
+}
+
+/* Background grid pattern */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(108,99,255,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(108,99,255,0.03) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+#root { position: relative; z-index: 1; }
+
+/* Ambient orbs */
+body::after {
+  content: '';
+  position: fixed;
+  top: -20vh;
+  left: -10vw;
+  width: 60vw;
+  height: 60vw;
+  background: radial-gradient(ellipse, rgba(108,99,255,0.06) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
