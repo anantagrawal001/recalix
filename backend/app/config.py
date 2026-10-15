@@ -29,7 +29,7 @@ EMBEDDING_DIM   = 512
 DEVICE_OVERRIDE = os.environ.get("RECALIX_DEVICE", "")
 
 # ── Indexing ──────────────────────────────────────────────────────────────────
-BATCH_SIZE        = 5
+BATCH_SIZE        = 16   # V10: increased for GPU speed
 THUMBNAIL_SIZE    = (256, 256)
 THUMBNAIL_QUALITY = 85
 CHECKPOINT_EVERY  = 100
@@ -42,7 +42,7 @@ ALL_EXTENSIONS   = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 # ── Search ────────────────────────────────────────────────────────────────────
 DEFAULT_TOP_K              = 50
 MAX_TOP_K                  = 500
-MIN_SIMILARITY_THRESHOLD   = 0.23
+MIN_SIMILARITY_THRESHOLD   = 0.20   # V10: slightly lower for better recall
 SCREENSHOT_ASPECT_PENALTY  = 0.03
 
 # Search backend: "cosine" | "faiss" | "auto"

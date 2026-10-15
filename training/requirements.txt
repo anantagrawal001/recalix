@@ -1,7 +1,6 @@
-# RECALIX V9 — Training Dependencies
-# These are a subset of backend/requirements.txt
-# If you already installed backend deps, nothing extra needed.
-
+# RECALIX V9 — Training dependencies
+# Install: pip install -r requirements.txt
 torch>=2.1.0
 torchvision>=0.16.0
+open-clip-torch>=2.24.0
 numpy>=1.24.0

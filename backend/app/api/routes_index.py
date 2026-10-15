@@ -5,11 +5,9 @@ GET  /api/index/status → Get live progress
 DELETE /api/index      → Clear the entire index
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Optional
-
 from app.core.indexer import start_indexing, get_progress
 from app.core import embedding_store
 from app.db import database
@@ -56,3 +54,27 @@ async def clear_index():
     database.clear_all()
     embedding_store.clear()
     return {"message": "Index cleared successfully"}
+
+
+@router.delete("/folder")
+async def clear_folder_index(
+    folder: str,
+    include_subfolders: bool = True,
+):
+    """Delete indexed media for a specific folder (optionally including subfolders)."""
+    if not folder:
+        raise HTTPException(status_code=400, detail="folder is required")
+
+    result = database.delete_media_by_folder(folder, include_subfolders=include_subfolders)
+    for thumb in result.get("thumbnails", []):
+        try:
+            Path(thumb).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return {
+        "message": "Folder index cleared",
+        "deleted": result.get("deleted", 0),
+        "folder": folder,
+        "include_subfolders": include_subfolders,
+    }

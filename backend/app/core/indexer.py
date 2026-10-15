@@ -10,17 +10,18 @@ Fixes over v1:
 - Crash-resumable: checkpoint every N files
 """
 
-import os
 import sys
-import time
 import hashlib
+import json
 import threading
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 import numpy as np
 
+from app.config import DATA_DIR
 from app.config import (
     IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, ALL_EXTENSIONS,
     BATCH_SIZE, CHECKPOINT_EVERY, CLIP_MODEL_NAME,
@@ -38,15 +39,65 @@ _progress: Dict[str, Any] = {
     "errors": 0,
     "new_indexed": 0,
     "current_file": "",
+    "detail": {},
     "started_at": None,
     "finished_at": None,
     "message": "",
 }
 _progress_lock = threading.Lock()
 _indexing_thread: Optional[threading.Thread] = None
+_indexing_process: Optional[subprocess.Popen] = None
+_PROGRESS_FILE = DATA_DIR / "index_status.json"
+
+
+def _creation_flags() -> int:
+    if sys.platform != "win32":
+        return 0
+    return getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+
+
+def _python_executable() -> str:
+    root_dir = Path(__file__).resolve().parents[3]
+    venv_python = root_dir / "venv_gpu" / "Scripts" / "python.exe"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            if not process:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(code)):
+                    return False
+                return code.value == 259
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process)
+        except Exception:
+            return False
+    try:
+        import os
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
 
 
 def get_progress() -> Dict[str, Any]:
+    if _PROGRESS_FILE.exists():
+        try:
+            return json.loads(_PROGRESS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     with _progress_lock:
         return dict(_progress)
 
@@ -54,6 +105,13 @@ def get_progress() -> Dict[str, Any]:
 def _set_progress(**kwargs):
     with _progress_lock:
         _progress.update(kwargs)
+        snapshot = dict(_progress)
+    try:
+        tmp = _PROGRESS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+        tmp.replace(_PROGRESS_FILE)
+    except Exception:
+        pass
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -100,6 +158,7 @@ def run_indexing(directory: str, reindex: bool = False):
         status="scanning",
         total=0, processed=0, skipped=0, errors=0, new_indexed=0,
         current_file="",
+        detail={"stage": "scan", "device": getattr(engine, "DEVICE", "auto")},
         started_at=datetime.now().isoformat(),
         finished_at=None,
         message="Scanning directory..."
@@ -158,6 +217,11 @@ def run_indexing(directory: str, reindex: bool = False):
 
             # Open images
             pil_images, valid_paths, valid_metas = [], [], []
+            _set_progress(detail={
+                "stage": "opening_batch",
+                "batch_size": len(batch_paths),
+                "device": getattr(engine, "DEVICE", "auto"),
+            })
             for p, m in zip(batch_paths, batch_metas):
                 img = open_image_for_clip(str(p))
                 if img:
@@ -170,6 +234,11 @@ def run_indexing(directory: str, reindex: bool = False):
             if pil_images:
                 try:
                     import torch
+                    _set_progress(detail={
+                        "stage": "embedding_batch",
+                        "batch_size": len(pil_images),
+                        "device": "cuda" if torch.cuda.is_available() else "cpu",
+                    })
                     embeddings = engine.embed_images(pil_images)       # (M, D), normalized
 
                     # Immediately free GPU memory
@@ -227,7 +296,20 @@ def run_indexing(directory: str, reindex: bool = False):
                         _set_progress(
                             processed=processed, skipped=skipped,
                             errors=errors, new_indexed=new_indexed,
-                            current_file=path.name
+                            current_file=path.name,
+                            detail={
+                                "stage": "committed_embedding",
+                                "file_type": meta.get("file_type"),
+                                "batch_size": len(valid_paths),
+                                "embedding_index": int(emb_idx),
+                                "width": width,
+                                "height": height,
+                                "ocr_chars": len(ocr_text or ""),
+                                "filename_tokens": filename_tokens,
+                                "is_document": bool(is_document),
+                                "is_screenshot": bool(is_screenshot),
+                                "device": "cuda" if torch.cuda.is_available() else "cpu",
+                            }
                         )
 
                 except Exception as e:
@@ -239,6 +321,7 @@ def run_indexing(directory: str, reindex: bool = False):
 
         for i, path in enumerate(image_files):
             _set_progress(current_file=path.name)
+            _set_progress(detail={"stage": "checking_file", "file_type": "image", "device": getattr(engine, "DEVICE", "auto")})
 
             meta = _get_file_meta(path)
             modified_at = meta["modified_at"]
@@ -311,6 +394,7 @@ def run_indexing(directory: str, reindex: bool = False):
             errors=errors,
             new_indexed=new_indexed,
             current_file="",
+            detail={"stage": "done", "device": getattr(engine, "DEVICE", "auto")},
             finished_at=datetime.now().isoformat(),
             message=(
                 f"Done! {new_indexed} new images indexed. "
@@ -329,11 +413,38 @@ def run_indexing(directory: str, reindex: bool = False):
 
 
 def start_indexing(directory: str, reindex: bool = False) -> bool:
-    global _indexing_thread
-    if _progress.get("status") in ("scanning", "indexing"):
+    global _indexing_thread, _indexing_process
+    current = get_progress()
+    if current.get("status") in ("scanning", "indexing") and _pid_alive(current.get("pid")):
         return False
-    _indexing_thread = threading.Thread(
-        target=run_indexing, args=(directory, reindex), daemon=True
+
+    _set_progress(
+        status="scanning",
+        total=0, processed=0, skipped=0, errors=0, new_indexed=0,
+        current_file="",
+        detail={"stage": "launching", "process": "index"},
+        started_at=datetime.now().isoformat(),
+        finished_at=None,
+        message="Launching indexing process...",
+        directory=directory,
+        reindex=reindex,
+        pid=None,
     )
-    _indexing_thread.start()
+
+    try:
+        backend_dir = Path(__file__).resolve().parents[2]
+        cmd = [_python_executable(), "-m", "app.core.index_cli", directory]
+        if reindex:
+            cmd.append("--reindex")
+        _indexing_process = subprocess.Popen(
+            cmd,
+            cwd=str(backend_dir),
+            creationflags=_creation_flags(),
+        )
+        _set_progress(pid=_indexing_process.pid, message="Indexing process started.")
+    except Exception:
+        _indexing_thread = threading.Thread(
+            target=run_indexing, args=(directory, reindex), daemon=True
+        )
+        _indexing_thread.start()
     return True

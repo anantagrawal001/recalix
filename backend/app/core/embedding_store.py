@@ -12,7 +12,6 @@ Fixes over v1:
 import json
 import threading
 import numpy as np
-from pathlib import Path
 from typing import List, Optional
 
 from app.config import EMBEDDINGS_PATH, EMBEDDING_DIM, DATA_DIR

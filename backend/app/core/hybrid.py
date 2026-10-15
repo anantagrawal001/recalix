@@ -113,14 +113,33 @@ def _filename_score(filename_tokens: str, query: str) -> float:
     return min(len(qt & ft) / len(qt), 1.0)
 
 
-def _structural_score(row: Dict[str, Any]) -> float:
+def _structural_score(row: Dict[str, Any], query: str = "") -> float:
+    """
+    Structural heuristic signal. Range: [-0.2, +0.3].
+    No +0.5 bias — only real discriminative signals.
+    Matches V5 behaviour: conditional document boost, screenshot penalty.
+    """
     from app.config import TINY_IMAGE_THRESHOLD
     score = 0.0
-    if row.get("is_document"):   score += 0.3
-    if row.get("is_screenshot"): score -= 0.2
+    q = query.lower()
+
+    # Document boost — only for document-type queries
+    doc_kw = {"document", "invoice", "receipt", "scan", "paper", "form", "certificate"}
+    if any(kw in q for kw in doc_kw):
+        if row.get("is_document"):
+            score += 0.3
+
+    # Screenshot penalty — unless user is asking for screenshots
+    if row.get("is_screenshot") and "screenshot" not in q:
+        score -= 0.1
+
+    # Tiny image penalty
     pa = row.get("pixel_area")
-    if pa and pa < TINY_IMAGE_THRESHOLD: score -= 0.3
-    return max(min(score + 0.5, 1.0), 0.0)
+    if pa and pa < TINY_IMAGE_THRESHOLD:
+        if not any(kw in q for kw in {"icon", "emoji", "logo"}):
+            score -= 0.15
+
+    return max(score, -0.2)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -139,7 +158,13 @@ def apply_hybrid_scoring(
         f = _filename_score(item.get("filename_tokens") or "", query)
         s = _structural_score(item)
 
-        item["score"]    = round(w["visual"]*v + w["text"]*t + w["filename"]*f + w["structural"]*s, 4)
+        # Normalize signals to a comparable [0.0, 1.0] scale
+        v_norm = float(np.clip((v - 0.15) / 0.20, 0.0, 1.0))
+        t_norm = float(np.clip(t, 0.0, 1.0))
+        f_norm = float(np.clip(f, 0.0, 1.0))
+        s_norm = float(np.clip((s + 0.2) / 0.5, 0.0, 1.0))
+
+        item["score"]    = round(w["visual"]*v_norm + w["text"]*t_norm + w["filename"]*f_norm + w["structural"]*s_norm, 4)
         item["_signals"] = {"visual": round(v,4), "text": round(t,4), "filename": round(f,4), "structural": round(s,4)}
         item["_weights"] = {k: round(wv, 4) for k, wv in w.items()}
 

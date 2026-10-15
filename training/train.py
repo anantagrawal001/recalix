@@ -1,272 +1,196 @@
 #!/usr/bin/env python3
 """
-RECALIX V9 — Training CLI (Research Edition)
-============================================
+RECALIX V10 — Training CLI
+===========================
+Run from the training/ directory with venv_gpu active.
 
-Adds:
-• Extensive logging
-• Artifact generation
-• Graph creation
-• CSV experiment tables
-• Run metadata
+Examples:
+  python train.py --mode basic      --epochs 5     (verify pipeline works)
+  python train.py --mode baseline   --epochs 15    (generate paper Table 1)
+  python train.py --mode semi_hard  --epochs 20    (production model)
+  python train.py --mode hard       --epochs 30    (after semi_hard converges)
+
+The model is saved to backend/data/fusion_model.pt
+Restart the backend after training to load the new model.
 """
 
 import argparse
+import re
 import sys
 import time
-import json
-import csv
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# ── Color helpers ─────────────────────────────────────────────────────────────
+R = "\033[0m"; B = "\033[1m"; G = "\033[92m"; Y = "\033[93m"
+C = "\033[96m"; D = "\033[2m"; W = "\033[97m"; E = "\033[91m"
+LOG_FILE = None
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
-# ──────────────────────────────────────────────────────────
-# Colors
-# ──────────────────────────────────────────────────────────
-
-class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    RED    = "\033[91m"
-    CYAN   = "\033[96m"
-    BLUE   = "\033[94m"
-    DIM    = "\033[2m"
-    WHITE  = "\033[97m"
-
-
-# ──────────────────────────────────────────────────────────
-# Banner
-# ──────────────────────────────────────────────────────────
-
-def banner():
-    print(f"""
-{C.CYAN}{C.BOLD}
-  ██████╗ ███████╗ ██████╗ █████╗ ██╗     ██╗██╗  ██╗
-  ██╔══██╗██╔════╝██╔════╝██╔══██╗██║     ██║╚██╗██╔╝
-  ██████╔╝█████╗  ██║     ███████║██║     ██║ ╚███╔╝
-  ██╔══██╗██╔══╝  ██║     ██╔══██║██║     ██║ ██╔██╗
-  ██║  ██║███████╗╚██████╗██║  ██║███████╗██║██╔╝ ██╗
-  ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝╚═╝  ╚═╝
-{C.RESET}{C.DIM}  V9 — Query-Conditioned Fusion Training{C.RESET}
-""")
-
-
-# ──────────────────────────────────────────────────────────
-# Artifact directories
-# ──────────────────────────────────────────────────────────
-
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-ROOT = Path(__file__).parent
-
-ART_DIR = ROOT / "artifacts" / f"run_{RUN_ID}"
-LOG_DIR = ART_DIR / "logs"
-GRAPH_DIR = ART_DIR / "graphs"
-TABLE_DIR = ART_DIR / "tables"
-
-for d in [LOG_DIR, GRAPH_DIR, TABLE_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
-
-LOG_FILE = LOG_DIR / "training.log"
-CSV_FILE = TABLE_DIR / "epoch_metrics.csv"
-
-history_epochs = []
-history_loss = []
-
-
-# ──────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────
+def save_log_line(line: str):
+    if not LOG_FILE:
+        return
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(ANSI_RE.sub("", line) + "\n")
 
 def log(msg: str):
+    ts    = datetime.now().strftime("%H:%M:%S")
+    color = (E if ("ERROR" in msg or "✗" in msg) else
+             G if ("✓" in msg or "Done" in msg or "complete" in msg.lower()) else
+             Y if ("⚠" in msg or "spike" in msg.lower()) else
+             C if "Epoch" in msg and "loss=" in msg else
+             B if "===" in msg or "TABLE" in msg else
+             D + W)
+    line = f"{D}[{ts}]{R} {color}{msg}{R}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "replace").decode("ascii"), flush=True)
+    save_log_line(f"[{ts}] {msg}")
 
-    ts = datetime.now().strftime("%H:%M:%S")
-
-    line = f"[{ts}] {msg}"
-
-    print(line)
-
-    with open(LOG_FILE, "a", encoding="utf8") as f:
-        f.write(line + "\n")
-
-
-# ──────────────────────────────────────────────────────────
-# Epoch callback
-# ──────────────────────────────────────────────────────────
-
-def epoch_cb(epoch, total, loss, recall):
-
-    history_epochs.append(epoch)
-    history_loss.append(loss)
-
-    with open(CSV_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([epoch, loss])
-
-    bar_len = 30
-    filled  = int(bar_len * epoch / total)
-
-    bar = "█" * filled + "░" * (bar_len - filled)
-
-    print(
-        f"\r  [{bar}] {epoch}/{total} loss={loss:.5f}",
-        end="" if epoch < total else "\n",
-        flush=True
-    )
-
-
-# ──────────────────────────────────────────────────────────
-# Graph generation
-# ──────────────────────────────────────────────────────────
-
-def save_graphs():
-
-    if not history_epochs:
-        return
-
-    plt.figure(figsize=(8,5))
-
-    plt.plot(history_epochs, history_loss)
-
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-
-    plt.title("Training Loss")
-
-    plt.grid(True)
-
-    plt.savefig(GRAPH_DIR / "loss_curve.png")
-
-    plt.close()
-
-
-# ──────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────
+def epoch_cb(epoch: int, total: int, loss: float, acc):
+    filled  = int(28 * epoch / total)
+    bar     = "█" * filled + "░" * (28 - filled)
+    acc_str = f"  acc={G}{acc:.3f}{R}" if acc is not None else ""
+    print(f"\r  [{C}{bar}{R}] {W}{epoch:3d}/{total}{R}"
+          f"  loss={Y}{loss:.5f}{R}{acc_str}",
+          end="" if epoch < total else "\n", flush=True)
+    save_log_line(f"Epoch {epoch}/{total} loss={loss:.5f}" + (f" acc={acc:.3f}" if acc is not None else ""))
 
 def main():
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--mode", default="semi_hard",
-                        choices=["basic","baseline","semi_hard","hard"])
-
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch_size", type=int, default=64)
-
-    parser.add_argument("--data_dir", type=str, default="")
-
+    global LOG_FILE
+    parser = argparse.ArgumentParser(description="RECALIX V10 Training")
+    parser.add_argument("--mode",       default="semi_hard",
+                        choices=["basic", "baseline", "semi_hard", "hard"])
+    parser.add_argument("--epochs",     type=int,   default=20)
+    parser.add_argument("--lr",         type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int,   default=64)
+    parser.add_argument("--data_dir",   type=str,   default="")
+    parser.add_argument("--output_path", type=str,  default="")
+    parser.add_argument("--run_id",     type=str,   default="")
+    parser.add_argument("--started_at", type=str,   default="")
     args = parser.parse_args()
 
-    banner()
+    print(f"\n{C}{B}  RECALIX V10 — Training CLI{R}")
+    print(f"{D}  {'─'*40}{R}")
 
+    # ── Find data directory ───────────────────────────────────────────────────
     script_dir = Path(__file__).resolve().parent
-
     if args.data_dir:
         data_dir = Path(args.data_dir)
     else:
-
-        candidates = [
+        for candidate in [
             script_dir.parent / "backend" / "data",
             script_dir.parent.parent / "backend" / "data",
-            script_dir / "data"
-        ]
-
-        data_dir = None
-
-        for c in candidates:
-            if (c / "embeddings.npy").exists():
-                data_dir = c
+        ]:
+            if (candidate / "embeddings.npy").exists():
+                data_dir = candidate
                 break
-
-        if data_dir is None:
-            print("ERROR: Cannot find backend/data directory")
+        else:
+            print(f"{E}ERROR: Cannot find backend/data. Run with --data_dir path/to/backend/data{R}")
             sys.exit(1)
 
-    output_path = data_dir / "fusion_model.pt"
+    output_path = Path(args.output_path) if args.output_path else data_dir / "fusion_model.pt"
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    LOG_FILE = data_dir / "training_logs" / f"terminal_{args.mode}_{run_id}.log"
 
+    # Make backend importable
     backend_dir = data_dir.parent
+    for p in [str(backend_dir), str(script_dir.parent)]:
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
-    if str(backend_dir) not in sys.path:
-        sys.path.insert(0, str(backend_dir))
+    print(f"\n  Mode        : {C}{args.mode}{R}")
+    print(f"  Epochs      : {W}{args.epochs}{R}")
+    print(f"  LR          : {W}{args.lr}{R}")
+    print(f"  Batch size  : {W}{args.batch_size}{R}")
+    print(f"  Data dir    : {D}{data_dir}{R}")
+    print(f"  Output      : {D}{output_path}{R}")
+    print(f"  Terminal log: {D}{LOG_FILE}{R}")
+    save_log_line(f"RECALIX V10 Training CLI mode={args.mode} epochs={args.epochs} lr={args.lr} batch_size={args.batch_size}")
 
-    modes_dir = script_dir / "modes"
-
-    if str(modes_dir.parent) not in sys.path:
-        sys.path.insert(0, str(modes_dir.parent))
-
-    log("Training configuration")
-    log(f"Mode: {args.mode}")
-    log(f"Epochs: {args.epochs}")
-    log(f"Batch size: {args.batch_size}")
-    log(f"Learning rate: {args.lr}")
-    log(f"Data directory: {data_dir}")
-    log(f"Output model: {output_path}")
-
+    # Quick stats
+    import json
+    meta_f = data_dir / "embeddings_meta.json"
+    if meta_f.exists():
+        count = json.loads(meta_f.read_text())["count"]
+        print(f"  Embeddings  : {G}{count:,}{R}")
     import sqlite3
-
-    db_path = data_dir / "metadata.db"
-
-    conn = sqlite3.connect(str(db_path))
-
-    n_media = conn.execute(
-        "SELECT COUNT(*) FROM media WHERE embedding_index IS NOT NULL"
-    ).fetchone()[0]
-
+    conn = sqlite3.connect(str(data_dir / "metadata.db"))
+    n = conn.execute("SELECT COUNT(*) FROM media WHERE embedding_index IS NOT NULL").fetchone()[0]
     conn.close()
+    print(f"  Media rows  : {G}{n:,}{R}")
+    save_log_line(f"Media rows: {n}")
 
-    log(f"Indexed images: {n_media}")
+    if n < 10:
+        print(f"\n{Y}⚠ Only {n} indexed images. Index more photos for meaningful training.{R}")
+
+    print(f"\n{D}  {'─'*40}{R}")
 
     t_start = time.time()
-
     try:
-
         from modes import get_trainer
-
         trainer = get_trainer(args.mode)
-
-        result = trainer.run(
-            data_dir=str(data_dir),
-            output_path=str(output_path),
-            epochs=args.epochs,
-            lr=args.lr,
-            batch_size=args.batch_size,
-            log_cb=log,
-            epoch_cb=epoch_cb
+        def safe_log(msg: str):
+            try:
+                log(msg)
+            except UnicodeEncodeError:
+                log(str(msg).encode("ascii", "replace").decode("ascii"))
+        result  = trainer.run(
+            data_dir    = str(data_dir),
+            output_path = str(output_path),
+            epochs      = args.epochs,
+            lr          = args.lr,
+            batch_size  = args.batch_size,
+            log_cb      = safe_log,
+            epoch_cb    = epoch_cb,
         )
-
     except KeyboardInterrupt:
-
-        print("Training interrupted")
+        print(f"\n{Y}Training stopped by user.{R}")
         sys.exit(0)
+    except Exception as e:
+        print(f"\n{E}Training failed: {e}{R}")
+        import traceback; traceback.print_exc()
+        sys.exit(1)
 
     elapsed = time.time() - t_start
-
-    save_graphs()
-
-    meta = {
-        "run_id": RUN_ID,
-        "mode": args.mode,
-        "epochs": args.epochs,
-        "lr": args.lr,
-        "batch_size": args.batch_size,
-        "time_seconds": elapsed
-    }
-
-    with open(ART_DIR / "run_metadata.json", "w") as f:
-        json.dump(meta, f, indent=2)
-
-    print("\nTraining complete")
-
-    print(f"Artifacts saved to:\n{ART_DIR}")
-
+    mins, secs = divmod(int(elapsed), 60)
+    print(f"\n{D}  {'─'*40}{R}")
+    print(f"  {G}✓ Training complete{R}  ({mins}m {secs}s)")
+    print(f"  Model → {G}{output_path}{R}")
+    save_log_line(f"Training complete ({mins}m {secs}s)")
+    save_log_line(f"Model -> {output_path}")
+    if result:
+        for k, v in result.items():
+            if k not in ("mode",):
+                print(f"  {k:<20}: {C}{v}{R}")
+                save_log_line(f"{k}: {v}")
+        artifact_dir = data_dir / "training_logs"
+        artifact_dir.mkdir(exist_ok=True)
+        artifact = {
+            "session_id": run_id,
+            "mode": args.mode,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "started_at": args.started_at or None,
+            "finished_at": datetime.now().isoformat(),
+            "result": result,
+            "status": "done",
+            "terminal_log_path": str(LOG_FILE),
+        }
+        import json as _json
+        artifact_path = artifact_dir / f"train_{args.mode}_{run_id}.json"
+        artifact_path.write_text(_json.dumps(artifact, indent=2), encoding="utf-8")
+        save_log_line(f"Training artifact -> {artifact_path}")
+    print(f"\n  {D}Restart the backend to load the new model.{R}\n")
 
 if __name__ == "__main__":
     main()

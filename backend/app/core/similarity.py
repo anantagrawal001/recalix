@@ -14,6 +14,7 @@ Pipeline:
 
 import numpy as np
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from app.core import embedding_store
@@ -52,6 +53,7 @@ def search(
     folder: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    extensions: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
 
     top_k       = min(top_k, MAX_TOP_K)
@@ -60,7 +62,9 @@ def search(
         return []
 
     total       = len(all_emb)
-    valid_idxs  = database.get_all_embedding_indices_with_filters(file_type, folder, date_from, date_to)
+    valid_idxs  = database.get_all_embedding_indices_with_filters(
+        file_type, folder, date_from, date_to, extensions
+    )
     if not valid_idxs:
         return []
 
@@ -99,7 +103,7 @@ def search(
         out.append({
             **row,
             "score":            round(score, 4),
-            "thumbnail_url":    f"/api/thumbnails/{emb_idx}" if row.get("thumbnail_path") else None,
+            "thumbnail_url":    f"/thumbs/{Path(row['thumbnail_path']).name}" if row.get("thumbnail_path") else None,
             "_search_backend":  "faiss" if use_faiss else "cosine",
         })
 
@@ -108,8 +112,16 @@ def search(
 
 
 def _cosine(query_embedding, all_emb, valid_idx, top_k):
-    filtered = np.array(all_emb[valid_idx], dtype=np.float32)
-    scores   = filtered @ query_embedding.astype(np.float32)
+    total = len(all_emb)
+    # If valid_idx represents a large portion of the database, it's faster to do a full memmap dot product
+    # and then filter the scores rather than copying all embeddings from the memmap file.
+    if len(valid_idx) > total * 0.2:
+        scores_all = all_emb @ query_embedding.astype(np.float32)
+        scores     = scores_all[valid_idx]
+    else:
+        filtered = np.array(all_emb[valid_idx], dtype=np.float32)
+        scores   = filtered @ query_embedding.astype(np.float32)
+
     k        = min(top_k, len(scores))
     top_pos  = np.argpartition(scores, -k)[-k:]
     top_pos  = top_pos[np.argsort(scores[top_pos])[::-1]]

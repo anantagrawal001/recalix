@@ -1,20 +1,17 @@
-"""
-RECALIX API — File Routes (Production Grade)
-=============================================
-Security fix: open-file now validates path against DB by ID, not raw frontend input.
-"""
+
 
 import os
 import sys
+import math
 import subprocess
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.db import database
-from app.config import THUMBNAILS_DIR
 
 router = APIRouter(prefix="/api", tags=["files"])
 
@@ -32,7 +29,11 @@ async def get_thumbnail(emb_index: int):
     thumb_path = Path(row["thumbnail_path"])
     if not thumb_path.exists():
         raise HTTPException(status_code=404, detail="Thumbnail file missing on disk")
-    return FileResponse(str(thumb_path), media_type="image/jpeg")
+    return FileResponse(
+        str(thumb_path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 # ── Open File (SECURITY FIX) ─────────────────────────────────────────────────
@@ -80,6 +81,45 @@ async def open_file(req: OpenFileRequest):
 async def get_folders():
     folders = database.get_all_folders()
     return {"folders": folders}
+
+
+@router.get("/gallery")
+async def get_gallery(
+    folder: Optional[str] = Query(None),
+    file_type: Optional[str] = Query("image", alias="type"),
+    ext: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(48, ge=1, le=200),
+):
+    file_type = file_type if file_type in ("image", "video") else None
+    ext_list = None
+    if ext:
+        ext_list = [e.strip().lower() for e in ext.split(",") if e.strip()]
+    data = database.get_media_gallery(
+        folder=folder,
+        file_type=file_type,
+        page=page,
+        page_size=page_size,
+        extensions=ext_list,
+    )
+    results = []
+    for row in data["items"]:
+        emb_idx = row.get("embedding_index")
+        results.append({
+            **row,
+            "score": 1.0,
+            "thumbnail_url": f"/thumbs/{Path(row['thumbnail_path']).name}" if row.get("thumbnail_path") else None,
+            "_search_backend": "gallery",
+        })
+    total = data["total"]
+    return {
+        "folder": folder,
+        "results": results,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": math.ceil(total / page_size) if total else 0,
+    }
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────

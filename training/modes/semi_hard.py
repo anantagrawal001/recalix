@@ -1,54 +1,53 @@
 """
-RECALIX Training — Semi-Hard Negative Mode
-============================================
-Mixed negative mining: 50% random + 50% semi-hard.
-Semi-hard = negatives that are close to anchor but further than positive.
-This is the RECOMMENDED default — best quality/speed tradeoff.
+RECALIX V10 — Semi-Hard Negative Training (RECOMMENDED)
+========================================================
+50% random negatives + 50% semi-hard negatives.
 
-Research reference: FaceNet (Schroff et al. 2015) negative mining strategy.
+Semi-hard negative: an image that is visually similar to the query
+but NOT the correct match (closer than positive by at most margin=0.30).
+This gives harder gradients than random but avoids training instability
+from fully hard negatives.
+
+All CLIP calls happen in _build() (main thread, before DataLoader).
+__getitem__ is pure numpy — no GPU calls inside DataLoader workers.
 """
 
 import random
-import torch
+import time
 import numpy as np
+import torch
 from torch.utils.data import DataLoader, Dataset
-from modes.base import BaseTrainer, RECALIXDataset, evaluate
+
+from modes.base import (
+    BaseTrainer,
+    RECALIXDataset,
+    compute_4signals,
+    dataset_summary,
+    evaluate,
+    evaluate_fixed_baselines,
+    process_log,
+    save_research_artifacts,
+)
 
 
 class SemiHardDataset(Dataset):
-    """Augmented dataset with semi-hard negative sampling."""
-
-    def __init__(self, base_dataset: RECALIXDataset, embeddings: np.ndarray, device: str):
-        self.base      = base_dataset
-        self.embeddings = torch.tensor(embeddings, dtype=torch.float32)
-        self.device    = device
+    def __init__(self, base: RECALIXDataset, embeddings: np.ndarray, metadata: list, margin: float = 0.30):
+        self.base        = base
+        self.embeddings  = embeddings   # CPU numpy — safe in DataLoader
+        self.metadata    = metadata
+        self.emb_to_meta = base._emb_to_meta
+        self.candidate_embedding_indices = base.candidate_embedding_indices
+        self.margin      = margin
 
     def __len__(self):
         return len(self.base)
 
     def __getitem__(self, i):
-        q_emb, pos_emb, neg_emb, q_type = self.base[i]
-
-        # 50% semi-hard mining
-        if random.random() < 0.5:
-            return q_emb, pos_emb, neg_emb, q_type
-
-        # Semi-hard: find negatives closer to anchor than positive but not too close
-        with torch.no_grad():
-            q = q_emb
-            sims   = self.embeddings @ q           # (N,)
-            pos_sim = (self.embeddings * pos_emb).sum(dim=1).max().item()
-
-            # Semi-hard candidates: sim in (pos_sim - margin, pos_sim)
-            margin = 0.15
-            mask   = (sims < pos_sim) & (sims > pos_sim - margin)
-            cands  = mask.nonzero(as_tuple=True)[0]
-
-            if len(cands) > 0:
-                idx    = cands[random.randint(0, len(cands) - 1)].item()
-                neg_emb = self.embeddings[idx]
-
-        return q_emb, pos_emb, neg_emb, q_type
+        q_emb, pos_sig, neg_sig, q_str = self.base[i]
+        # The base dataset already chooses negatives from the top-K visually
+        # similar candidates. Reusing those precomputed negatives keeps large
+        # research runs tractable and avoids a full embedding scan per batch item.
+        return q_emb, pos_sig, neg_sig
 
 
 class SemiHardTrainer(BaseTrainer):
@@ -56,38 +55,65 @@ class SemiHardTrainer(BaseTrainer):
 
     def run(self, data_dir, output_path, epochs, lr, batch_size, log_cb, epoch_cb):
         self._setup(data_dir, epochs, lr, batch_size, log_cb)
-        log_cb("Mode: SEMI-HARD (50% random + 50% semi-hard negatives) [RECOMMENDED]")
+        log_cb("Mode: SEMI-HARD (50% random + 50% semi-hard negatives)  [RECOMMENDED]")
 
-        base_train = RECALIXDataset(self.embeddings, self.metadata, "train")
-        base_val   = RECALIXDataset(self.embeddings, self.metadata, "val")
-        train_ds   = SemiHardDataset(base_train, self.embeddings, self.device)
-        loader     = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+        log_cb("Building datasets — computing CLIP text embeddings for all images…")
+        t0 = time.time()
+        base_train = RECALIXDataset(
+            self.embeddings, self.metadata, self.embed_fn,
+            split="train", top_k_neg=50, log_cb=log_cb,
+            data_dir=data_dir, negative_mode="mixed",
+        )
+        base_val = RECALIXDataset(
+            self.embeddings, self.metadata, self.embed_fn,
+            split="val", top_k_neg=50, log_cb=log_cb,
+            data_dir=data_dir, negative_mode="mixed",
+        )
+        log_cb(f"Dataset build: {time.time()-t0:.0f}s")
 
-        log_cb(f"Train: {len(train_ds)}, Val: {len(base_val)}")
+        # Pre-training diagnostic — detect too-easy negatives early
+        if base_train.examples:
+            pos_sims = [e["pos_sig"][0] for e in base_train.examples[:100]]
+            neg_sims = [e["neg_sig"][0] for e in base_train.examples[:100]]
+            avg_gap  = float(np.mean([p - n for p, n in zip(pos_sims, neg_sims)]))
+            log_cb(f"Pre-training: avg pos-neg visual gap = {avg_gap:.4f} (margin = 0.40)")
+            if avg_gap > 0.40:
+                log_cb("⚠ Gap already larger than margin — negatives may be too easy.")
+                log_cb("  Training will still run. For better results, index diverse photos.")
+            else:
+                log_cb("✓ Training difficulty is reasonable.")
+
+        train_ds = SemiHardDataset(base_train, self.embeddings, self.metadata)
+        loader   = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=0)
+
+        log_cb(f"Train: {len(train_ds)}  Val: {len(base_val)}")
         if len(train_ds) == 0:
             log_cb("ERROR: No training examples."); return {}
 
+        baseline_results = evaluate_fixed_baselines(base_val.examples)
+        best_fixed_acc = max(baseline_results.values()) if baseline_results else 0.0
+        log_cb("Fixed baselines: " + "  ".join(
+            f"{name}={acc:.3f}" for name, acc in baseline_results.items()
+        ))
+
         best_loss = float("inf")
+        best_acc = 0.0
         best_path = str(output_path).replace(".pt", "_best.pt")
+        history = []
 
         for epoch in range(1, epochs + 1):
             self.model.train()
             epoch_loss = 0.0
 
-            for q_emb, pos_emb, neg_emb, _ in loader:
+            for q_emb, pos_sig, neg_sig in loader:
                 q_emb   = q_emb.to(self.device)
-                pos_emb = pos_emb.to(self.device)
-                neg_emb = neg_emb.to(self.device)
+                pos_sig = pos_sig.to(self.device)
+                neg_sig = neg_sig.to(self.device)
 
-                w = self.model(q_emb)  # (B,4)
-
-                # All 4 weighted signals
-                def hybrid_score(ref, emb):
-                    return (w[:, 0] * (ref * emb).sum(dim=1)).mean()
-
-                pos_score = hybrid_score(q_emb, pos_emb)
-                neg_score = hybrid_score(q_emb, neg_emb)
-                loss = self.loss_fn(pos_score, neg_score)
+                w         = self.model(q_emb)              # (B, 4)
+                pos_score = (w * pos_sig).sum(dim=1)       # (B,)
+                neg_score = (w * neg_sig).sum(dim=1)       # (B,)
+                loss      = self.loss_fn(pos_score, neg_score)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -102,17 +128,50 @@ class SemiHardTrainer(BaseTrainer):
                 best_loss = avg_loss
                 self.save_model(self.model, best_path, {"mode": "semi_hard", "epoch": epoch, "loss": best_loss})
 
-            # Eval every 5 epochs
-            recall = None
-            if epoch % 5 == 0 or epoch == epochs:
-                res = evaluate(self.model, self.embeddings, self.metadata, self.device)
-                if "visual" in res:
-                    recall = res["visual"].get("recall@5")
-                for bkt, metrics in res.items():
-                    log_cb(f"  [{bkt}] R@1={metrics['recall@1']:.3f} R@5={metrics['recall@5']:.3f} MRR={metrics['mrr']:.3f}")
+            acc = evaluate(self.model, base_val.examples, self.device)
+            best_acc = max(best_acc, acc)
+            history.append({"epoch": epoch, "loss": avg_loss, "val_acc": acc})
+            log_cb(f"  Epoch {epoch}/{epochs}: loss={avg_loss:.4f}  val_acc={acc:.3f}")
 
-            epoch_cb(epoch, epochs, avg_loss, recall)
+            # Detailed weight stats every 5 epochs
+            if epoch % 5 == 0 or epoch == epochs:
+                with torch.no_grad():
+                    sample = base_val.examples[:50]
+                    if sample:
+                        sq = torch.tensor(
+                            np.stack([e["query_emb"] for e in sample]), dtype=torch.float32
+                        ).to(self.device)
+                        ww = self.model(sq).cpu().numpy()
+                        wm, ws = ww.mean(0), ww.std(0)
+                        keys = ["visual", "text", "filename", "structural"]
+                        log_cb("  Weights: " + "  ".join(
+                            f"{k}={wm[j]:.3f}±{ws[j]:.3f}" for j, k in enumerate(keys)
+                        ))
+                        if ws.max() < 0.01:
+                            log_cb("  ⚠ Weights not varying — model not differentiating signals")
+                            log_cb("  Tip: index more diverse photos (not just screenshots)")
+
+            epoch_cb(epoch, epochs, avg_loss, acc)
 
         self.save_model(self.model, output_path, {"mode": "semi_hard", "epochs": epochs, "best_loss": best_loss})
         log_cb(f"✓ Done. Best loss: {best_loss:.5f}")
-        return {"mode": "semi_hard", "best_loss": best_loss, "epochs": epochs}
+        result = {
+            "mode": "semi_hard",
+            "best_loss": best_loss,
+            "best_val_acc": best_acc,
+            "best_fixed_acc": best_fixed_acc,
+            "gain": best_acc - best_fixed_acc,
+            "epochs": epochs,
+        }
+        artifact_paths = save_research_artifacts(
+            mode="semi_hard",
+            output_path=str(output_path),
+            metrics=history,
+            summary=dataset_summary(base_train.examples, base_val.examples),
+            baseline_results=baseline_results,
+            result=result,
+            process=process_log(base_train, base_val, "semi_hard"),
+        )
+        log_cb(f"Research artifacts saved → {artifact_paths['artifact_dir']}")
+        result["artifact_dir"] = artifact_paths["artifact_dir"]
+        return result

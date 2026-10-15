@@ -1,5 +1,5 @@
 """
-RECALIX V9 — FastAPI Application
+RECALIX V10 — FastAPI Application
 ===================================
 Serves REST API + React SPA (production build).
 Startup: init DB → warmup CLIP → try load FAISS index → try load fusion model
@@ -25,9 +25,9 @@ STATIC_DIR = BASE_DIR / "static"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("━" * 60)
-    print("  RECALIX V9  — Local AI Photo Search")
-    print("━" * 60)
+    print("=" * 60)
+    print("  RECALIX V10 - Local AI Photo Search")
+    print("=" * 60)
 
     init_db()
     print("[Boot] Database ready.")
@@ -43,8 +43,8 @@ async def lifespan(app: FastAPI):
     # Fusion model (non-blocking, best-effort)
     await loop.run_in_executor(None, _try_load_fusion)
 
-    print(f"[Boot] Ready → http://localhost:{API_PORT}")
-    print("━" * 60)
+    print(f"[Boot] Ready -> http://localhost:{API_PORT}")
+    print("=" * 60)
     yield
     print("[Shutdown] RECALIX stopping.")
 
@@ -63,7 +63,7 @@ def _try_load_faiss():
         if faiss_search.load_index():
             print("[Boot] FAISS index loaded.")
         else:
-            print("[Boot] No FAISS index — using cosine search.")
+            print("[Boot] No FAISS index - using cosine search.")
     except Exception as e:
         print(f"[Boot] FAISS load skipped: {e}")
 
@@ -75,13 +75,17 @@ def _try_load_fusion():
         s = get_fusion_status()
         if s["fusion_active"]:
             print(f"[Boot] Fusion model active (device={s['device']}).")
+            print(f"[Boot] Search: CLIP text embed -> cosine/FAISS -> fusion re-score (adaptive weights)")
         else:
-            print("[Boot] No fusion model — using fixed hybrid weights.")
+            fw = s["fallback_weights"]
+            print(f"[Boot] No fusion model - fixed weights: visual={fw['visual']}, text={fw['text']}, filename={fw['filename']}")
+            print(f"[Boot] Search: CLIP text embed -> cosine/FAISS -> fixed hybrid re-score")
+            print(f"[Boot] Tip: Run training to improve search quality with learned weights.")
     except Exception as e:
         print(f"[Boot] Fusion load skipped: {e}")
 
 
-app = FastAPI(title="RECALIX V9", description="Local AI Photo Search", version="9.0.0", lifespan=lifespan)
+app = FastAPI(title="RECALIX V10", description="Local AI Photo Search", version="10.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -105,7 +109,7 @@ async def health():
     from app.core import embedding_store
     return {
         "status":         "ok",
-        "version":        "9.0.0",
+        "version":        "10.0.0",
         "indexed":        embedding_store.count(),
         "search_backend": get_active_backend(),
         "fusion":         get_fusion_status()["fusion_active"],
@@ -116,11 +120,14 @@ async def health():
 async def root():
     if STATIC_DIR.exists() and (STATIC_DIR / "index.html").exists():
         return FileResponse(str(STATIC_DIR / "index.html"))
-    return {"message": "RECALIX V9 backend running", "docs": "/docs"}
+    return {"message": "RECALIX V10 backend running", "docs": "/docs"}
 
 
 # Serve static assets + SPA fallback
 if STATIC_DIR.exists():
+    if THUMBNAILS_DIR.exists():
+        app.mount("/thumbs", StaticFiles(directory=str(THUMBNAILS_DIR)), name="thumbs")
+
     assets = STATIC_DIR / "assets"
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
